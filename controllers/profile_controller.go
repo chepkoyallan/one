@@ -18,10 +18,18 @@ package controllers
 
 import (
 	"context"
+	"fmt"
+	"github.com/cenkalti/backoff"
 	"github.com/go-logr/logr"
+	istioSecurity "istio.io/api/security/v1beta1"
+	istioSecurityClient "istio.io/client-go/pkg/apis/security/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"reflect"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -31,6 +39,13 @@ import (
 	icodeaiv1 "github.com/chepkoy/one/api/v1"
 	corev1 "k8s.io/api/core/v1"
 )
+
+const AUTHZPOLICYISTIO = "ns-owner-access-istio"
+
+// annotation key, consumed by kfam API
+const USER = "user"
+const ROLE = "role"
+const ADMIN = "admin"
 
 const (
 	Admin               = "icodeai-admin"
@@ -106,8 +121,88 @@ func (r *ProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 
 	updateNamespaceLabels(ns)
+	if err := controllerutil.SetControllerReference(instance, ns, r.Scheme); err != nil {
+		IncRequestErrorCounter("error setting ControllerReference", SEVERITY_MAJOR)
+		logger.Error(err, "error setting ControllerReference")
+		return reconcile.Result{}, err
+	}
+
+	// If Namespace is not found  create a if found report back
+	foundNs := &corev1.Namespace{}
+	err = r.Get(ctx, types.NamespacedName{Name: ns.Name}, foundNs)
+
+	// if there is no error and namespace is not found
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Creating Namespace: " + ns.Name)
+			// create ns
+			err = r.Create(ctx, ns)
+			// Error found
+			if err != nil {
+				IncRequestErrorCounter("error creating namespace", SEVERITY_MAJOR)
+				logger.Error(err, "error creating namespace")
+				return reconcile.Result{}, err
+			}
+			//if error is nil i.e not found
+			// wait for 15 sec for new namespace creation
+			err = backoff.Retry(
+				func() error {
+					return r.Get(ctx, types.NamespacedName{Name: ns.Name}, foundNs)
+				},
+				backoff.WithMaxRetries(backoff.NewConstantBackOff(3*time.Second), 5))
+			if err != nil {
+				IncRequestErrorCounter("error namespace create completion", SEVERITY_MAJOR)
+				logger.Error(err, "error namespace completion")
+				return r.appendErrorConditionAndReturn(ctx, instance, "Owning namespace failed to create within 15 seconds")
+			}
+			logger.Info("Created Namespace: "+foundNs.Name, "status", foundNs.Status.Phase)
+		} else {
+			IncRequestErrorCounter("error reading namespace", SEVERITY_MAJOR)
+			logger.Error(err, "error reading namespace")
+		}
+	} else {
+		//Check existing namespace ownwership before move forward
+		owner, ok := foundNs.Annotations["owner"]
+		if ok && owner == instance.Spec.Owner.Name {
+			if updated := updateNamespaceLabels(foundNs); updated {
+				err = r.Update(ctx, foundNs)
+				if err != nil {
+					IncRequestErrorCounter("Error updating namespace label", SEVERITY_MAJOR)
+					logger.Error(err, "error updating namespace label")
+					return reconcile.Result{}, err
+				}
+			}
+		} else {
+			logger.Info(fmt.Sprintf("namespace already exist, but not owned by profile creator %v",
+				instance.Spec.Owner.Name))
+			IncRequestCounter("reject profile taking over existing namespace")
+			return r.appendErrorConditionAndReturn(ctx, instance, fmt.Sprintf(
+				"namespace already exist, nut not owned by profile %v", instance.Spec.Owner.Name))
+		}
+	}
+
+	// update Istio Authorizatio Policy
+	// Create Istio AuthorizationPolicy in target namespace, which will give ns owner permission to access services in ns.
+
+	//if err = r.updateIstioAuthorizationPolicy(instance); err != nil {
+	//	logger.Error(err, "error Updating Istio Authorization permission", "namespace", instance.Name)
+	//	logger.Error(err, "error updating Istio AuthorizationPolicy permission", SEVERITY_MAJOR)
+	//	return reconcile.Result{}, err
+	//}
 
 	return ctrl.Result{}, nil
+}
+
+// appendErrorConditionAndReturn append failure status to profile CR and mark Reconcile done. If update condition failed, request will be requeued.
+func (r *ProfileReconciler) appendErrorConditionAndReturn(ctx context.Context, instance *icodeaiv1.Profile, message string) (ctrl.Result, error) {
+	instance.Status.Conditions = append(instance.Status.Conditions, icodeaiv1.ProfileCondition{
+		Type:    icodeaiv1.ProfileFailed,
+		Message: message,
+	})
+	if err := r.Update(ctx, instance); err != nil {
+		return reconcile.Result{}, err
+	}
+	return reconcile.Result{}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
@@ -129,4 +224,102 @@ func updateNamespaceLabels(ns *corev1.Namespace) bool {
 		}
 	}
 	return updated
+}
+
+func (r *ProfileReconciler) getAuthorizationPolicy(profileIns *icodeaiv1.Profile) istioSecurity.AuthorizationPolicy {
+	return istioSecurity.AuthorizationPolicy{
+		Action: istioSecurity.AuthorizationPolicy_ALLOW,
+		//Empty selector == match all workloads in namespace
+		Selector: nil,
+		Rules: []*istioSecurity.Rule{
+			{
+				When: []*istioSecurity.Condition{
+					{
+						// Namespace Owner can access all workloads in the
+						// namespace
+						Key: fmt.Sprintf("request.headers[%v]", r.UserIdHeader),
+						Values: []string{
+							r.UserIDPrefix + profileIns.Spec.Owner.Name,
+						},
+					},
+				},
+			},
+			{
+				When: []*istioSecurity.Condition{
+					{
+						//Workloads in the same namespace can access all other
+						//workloads in the namespace
+						Key:    fmt.Sprintf("source.namespace"),
+						Values: []string{profileIns.Name},
+					},
+				},
+			},
+			{
+				To: []*istioSecurity.Rule_To{
+					{
+						Operation: &istioSecurity.Operation{
+							// Workloads paths should be accessible for KNative's
+							// `activators` and `controller` probes
+							// See: https://knative.dev/docs/serving/istio-authorization/#allowing-access-from-system-pods-by-paths
+							Paths: []string{
+								"/healthz",
+								"/metrics",
+								"/wait-for-domain",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// updateIstioAuthorizationPolicy create or update Istio AuthorizationPolicy
+// resources in target namespace owned by "profileIns". The goal is to allow
+// service access for profile owner.
+func (r *ProfileReconciler) updateIstioAuthorizationPolicy(profileIns *icodeaiv1.Profile) error {
+	logger := r.Log.WithValues("profile", profileIns.Name)
+	istioAuth := &istioSecurityClient.AuthorizationPolicy{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{USER: profileIns.Spec.Owner.Name, ROLE: ADMIN},
+			Name:        AUTHZPOLICYISTIO,
+			Namespace:   profileIns.Name,
+		},
+		Spec: r.getAuthorizationPolicy(profileIns),
+	}
+	if err := controllerutil.SetControllerReference(profileIns, istioAuth, r.Scheme); err != nil {
+		return err
+	}
+	foundAuthorizationPolicy := &istioSecurityClient.AuthorizationPolicy{}
+	err := r.Get(
+		context.TODO(),
+		types.NamespacedName{
+			Name:      istioAuth.ObjectMeta.Name,
+			Namespace: istioAuth.ObjectMeta.Namespace,
+		},
+		foundAuthorizationPolicy,
+	)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Creating istio AuthorizationPolicy", "namespace", istioAuth.ObjectMeta.Namespace,
+				"name", istioAuth.ObjectMeta.Name)
+			err = r.Create(context.TODO(), istioAuth)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	} else {
+		if !reflect.DeepEqual(istioAuth, foundAuthorizationPolicy) {
+			foundAuthorizationPolicy.Spec = istioAuth.Spec
+			logger.Info("Updating Istio AuthorizationPolicy", "namespace", istioAuth.ObjectMeta.Namespace,
+				"name", istioAuth.ObjectMeta.Name)
+			err = r.Update(context.TODO(), foundAuthorizationPolicy)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
