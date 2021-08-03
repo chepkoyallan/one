@@ -1,0 +1,16 @@
+domain: icodeai.io
+layout:
+- go.kubebuilder.io/v3
+projectName: one
+repo: github.com/chepkoy/one
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: icodeai.io
+  group: icodeai
+  kind: Profile
+  path: github.com/chepkoy/one/api/v1
+  version: v1
+version: "3"
