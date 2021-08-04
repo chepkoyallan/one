@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/cenkalti/backoff"
+	"github.com/ghodss/yaml"
 	"github.com/go-logr/logr"
 	istioSecurity "istio.io/api/security/v1beta1"
 	istioSecurityClient "istio.io/client-go/pkg/apis/security/v1beta1"
@@ -58,6 +59,7 @@ const (
 const DEFAULT_EDITOR = "default-editor"
 const DEFAULT_VIEWER = "default-viewer"
 const ICODEAIQUOTA = "kf-resource-quota"
+const PROFILEFINALIZER = "profile-finalizer"
 
 var NamespaceLabels = map[string]string{
 	"katib-metricscollector-injection":      "enabled",
@@ -74,6 +76,13 @@ type ProfileReconciler struct {
 	UserIdHeader     string
 	UserIDPrefix     string
 	WorkloadIdentity string
+}
+type Plugin interface {
+	// Called when profile CR is created / updated
+	ApplyPlugin(*ProfileReconciler, *icodeaiv1.Profile) error
+	// Called when profile CR is being deleted, to cleanup any non-k8s resources created via ApplyPlugin
+	// RevokePlugin logic need to be IDEMPOTENT
+	RevokePlugin(*ProfileReconciler, *icodeaiv1.Profile) error
 }
 
 //+kubebuilder:rbac:groups=icodeai.icodeai.io,resources=profiles,verbs=get;list;watch;create;update;patch;delete
@@ -253,7 +262,59 @@ func (r *ProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		logger.Info("No update on resource quota", "spec", instance.Spec.ResourceQuotaSpec.String())
 	}
 
-	//if err := r.Pa
+	if err := r.PatchDefaultPluginSpec(ctx, instance); err != nil {
+		IncRequestErrorCounter("error patching DefaultPluginSpec", SEVERITY_MAJOR)
+		logger.Error(err, "Failed patching DefaultPluginSpec", "namespace", instance.Name)
+		return reconcile.Result{}, err
+	}
+
+	if plugins, err := r.GetPluginSpec(instance); err == nil {
+		for _, plugin := range plugins {
+			if err2 := plugin.ApplyPlugin(r, instance); err2 != nil {
+				logger.Error(err2, "Failed applying plugin", "namespace", instance.Name)
+				IncRequestErrorCounter("error applying plugin", SEVERITY_MAJOR)
+				return reconcile.Result{}, err2
+			}
+		}
+	}
+
+	// examine DeletionTimestamp to determine if object is under deletion
+	if instance.ObjectMeta.DeletionTimestamp.IsZero() {
+		// The object is not being deleted, so if it does not have our finalizer,
+		// then lets add the finalizer and update the object. This is equivalent
+		// registering our finalizer.
+		if !containsString(instance.ObjectMeta.Finalizers, PROFILEFINALIZER) {
+			instance.ObjectMeta.Finalizers = append(instance.ObjectMeta.Finalizers, PROFILEFINALIZER)
+			if err := r.Update(ctx, instance); err != nil {
+				logger.Error(err, "error updating finalizer", "namespace", instance.Name)
+				IncRequestErrorCounter("error updating finalizer", SEVERITY_MAJOR)
+				return ctrl.Result{}, err
+			}
+		}
+	} else {
+		// The object is being deleted
+		if containsString(instance.ObjectMeta.Finalizers, PROFILEFINALIZER) {
+			// our finalizer is present, so lets revoke all Plugins to clean up any external dependencies
+			if plugins, err := r.GetPluginSpec(instance); err == nil {
+				for _, plugin := range plugins {
+					if err := plugin.RevokePlugin(r, instance); err != nil {
+						logger.Error(err, "error revoking plugin", "namespace", instance.Name)
+						IncRequestErrorCounter("error revoking plugin", SEVERITY_MAJOR)
+						return reconcile.Result{}, err
+					}
+				}
+			}
+
+			// remove our finalizer from the list and update it.
+			instance.ObjectMeta.Finalizers = removeString(instance.ObjectMeta.Finalizers, PROFILEFINALIZER)
+			if err := r.Update(ctx, instance); err != nil {
+				logger.Error(err, "error removing finalizer", "namespace", instance.Name)
+				IncRequestErrorCounter("error removing finalizer", SEVERITY_MAJOR)
+				return ctrl.Result{}, err
+			}
+		}
+	}
+	IncRequestCounter("reconcile")
 	return ctrl.Result{}, nil
 }
 
@@ -525,4 +586,59 @@ func (r *ProfileReconciler) PatchDefaultPluginSpec(ctx context.Context, profileI
 		return err
 	}
 	return nil
+}
+
+// GetPluginSpec will try to unmarshal the plugin spec inside profile for the specified plugin
+// Returns an error if the plugin isn't defined or if there is a problem
+func (r *ProfileReconciler) GetPluginSpec(profileIns *icodeaiv1.Profile) ([]Plugin, error) {
+	logger := r.Log.WithValues("profile", profileIns.Name)
+	plugins := []Plugin{}
+	for _, p := range profileIns.Spec.Plugins {
+		var pluginIns Plugin
+		switch p.Kind {
+		case KIND_WORKLOAD_IDENTITY:
+			pluginIns = &GcpWorkloadIdentity{}
+		case KIND_AWS_IAM_FOR_SERVICE_ACCOUNT:
+			pluginIns = &AwsIAMForServiceAccount{}
+		default:
+			logger.Info("Plugin not recgonized: ", "Kind", p.Kind)
+			continue
+		}
+
+		// To deserialize it to a specific type we need to first serialize it to bytes
+		// and then unserialize it.
+		specBytes, err := yaml.Marshal(p.Spec)
+
+		if err != nil {
+			logger.Info("Could not marshal plugin ", p.Kind, "; error: ", err)
+			return nil, err
+		}
+
+		err = yaml.Unmarshal(specBytes, pluginIns)
+		if err != nil {
+			logger.Info("Could not unmarshal plugin ", p.Kind, "; error: ", err)
+			return nil, err
+		}
+		plugins = append(plugins, pluginIns)
+	}
+	return plugins, nil
+}
+
+func removeString(slice []string, s string) (result []string) {
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		result = append(result, item)
+	}
+	return
+}
+
+func containsString(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
 }
