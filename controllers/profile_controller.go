@@ -498,3 +498,31 @@ func (r *ProfileReconciler) updateResourceQuota(profileIns *icodeaiv1.Profile, r
 	}
 	return nil
 }
+
+// PatchDefaultPluginSpec patch default plugins to profile CR instance if user doesn't specify plugin of same kind in CR.
+func (r *ProfileReconciler) PatchDefaultPluginSpec(ctx context.Context, profileIns *icodeaiv1.Profile) error {
+	//read existing plugins into map
+	plugins := make(map[string]icodeaiv1.Plugin)
+	for _, p := range profileIns.Spec.Plugins {
+		plugins[p.Kind] = p
+	}
+	//patch default plugins if same kind doesnt exist yet
+	if r.WorkloadIdentity != "" {
+		if _, ok := plugins[KIND_WORKLOAD_IDENTITY]; !ok {
+			if _, ok := plugins[KIND_WORKLOAD_IDENTITY]; !ok {
+				profileIns.Spec.Plugins = append(profileIns.Spec.Plugins, icodeaiv1.Plugin{
+					TypeMeta: metav1.TypeMeta{
+						Kind: KIND_WORKLOAD_IDENTITY,
+					},
+					Spec: &runtime.RawExtension{
+						Raw: []byte(fmt.Sprintf(`{"gcpServiceAccount":"%v"}`, r.WorkloadIdentity)),
+					},
+				})
+			}
+		}
+	}
+	if err := r.Update(ctx, profileIns); err != nil {
+		return err
+	}
+	return nil
+}
