@@ -23,6 +23,7 @@ import (
 	"github.com/go-logr/logr"
 	istioSecurity "istio.io/api/security/v1beta1"
 	istioSecurityClient "istio.io/client-go/pkg/apis/security/v1beta1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -184,11 +185,16 @@ func (r *ProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// update Istio Authorizatio Policy
 	// Create Istio AuthorizationPolicy in target namespace, which will give ns owner permission to access services in ns.
 
-	//if err = r.updateIstioAuthorizationPolicy(instance); err != nil {
-	//	logger.Error(err, "error Updating Istio Authorization permission", "namespace", instance.Name)
-	//	logger.Error(err, "error updating Istio AuthorizationPolicy permission", SEVERITY_MAJOR)
-	//	return reconcile.Result{}, err
-	//}
+	if err = r.updateIstioAuthorizationPolicy(instance); err != nil {
+		logger.Error(err, "error Updating Istio Authorization permission", "namespace", instance.Name)
+		logger.Error(err, "error updating Istio AuthorizationPolicy permission", SEVERITY_MAJOR)
+		return reconcile.Result{}, err
+	}
+
+	// Update service accounts
+	// Create service account "default-editor" in target namespace.
+	// "default-editor" would have kubeflowEdit permission: edit all resources in target namespace except rbac.
+	//if err = r.updateSer
 
 	return ctrl.Result{}, nil
 }
@@ -320,6 +326,85 @@ func (r *ProfileReconciler) updateIstioAuthorizationPolicy(profileIns *icodeaiv1
 				return err
 			}
 		}
+	}
+	return nil
+}
+
+// updateServiceAccount create or update service account "saName" with role "ClusterRoleName" in target namespace owned by "profileIns"
+func (r *ProfileReconciler) updateServiceAccount(profileIns *icodeaiv1.Profile, saName string, ClusterRoleName string) error {
+	logger := r.Log.WithValues("profile", profileIns.Name)
+	serviceAccount := &corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      saName,
+			Namespace: profileIns.Name,
+		},
+	}
+	if err := controllerutil.SetControllerReference(profileIns, serviceAccount, r.Scheme); err != nil {
+		return err
+	}
+	found := &corev1.ServiceAccount{}
+	err := r.Get(context.TODO(), types.NamespacedName{Name: serviceAccount.Name, Namespace: serviceAccount.Namespace}, found)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Creating Service Account", "namespace", serviceAccount.Namespace, "name", serviceAccount.Name)
+			err = r.Create(context.TODO(), serviceAccount)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	}
+	roleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      saName,
+			Namespace: profileIns.Name,
+		},
+		// Use default ClusterRole 'admin' for profile/namespace owner
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "ClusterRoleName",
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      rbacv1.ServiceAccountKind,
+				Name:      saName,
+				Namespace: profileIns.Name,
+			},
+		},
+	}
+	return r.updateRoleBinding(profileIns, roleBinding)
+}
+
+func (r *ProfileReconciler) updateRoleBinding(profileIns *icodeaiv1.Profile, roleBinding *rbacv1.RoleBinding) error {
+	logger := r.Log.WithValues("profile", profileIns.Name)
+	if err := controllerutil.SetControllerReference(profileIns, roleBinding, r.Scheme); err != nil {
+		return err
+	}
+	found := &rbacv1.RoleBinding{}
+	err := r.Get(context.TODO(), types.NamespacedName{Name: roleBinding.Name, Namespace: roleBinding.Namespace}, found)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("Creating RoleBinding", "namespace", roleBinding.Namespace, "name", roleBinding.Name)
+			err = r.Create(context.TODO(), roleBinding)
+			if err != nil {
+				return err
+			} else {
+				return err
+			}
+		} else {
+			if !(reflect.DeepEqual(roleBinding.RoleRef, found.RoleRef) && reflect.DeepEqual(roleBinding.Subjects, found.Subjects)) {
+				found.RoleRef = roleBinding.RoleRef
+				found.Subjects = roleBinding.Subjects
+				logger.Info("updating Rolebinding", "namespace", roleBinding.Namespace, "name", roleBinding.Name)
+				err = r.Update(context.TODO(), found)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
 	}
 	return nil
 }
