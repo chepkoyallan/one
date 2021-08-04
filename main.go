@@ -31,8 +31,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	icodeaiv1 "github.com/chepkoy/one/api/v1"
-	"github.com/chepkoy/one/controllers"
+	icodeaiv1 "github.com/chepkoyallan/one/api/v1"
+	"github.com/chepkoyallan/one/controllers"
 	//+kubebuilder:scaffold:imports
 )
 

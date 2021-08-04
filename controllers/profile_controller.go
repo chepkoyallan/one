@@ -38,7 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	icodeaiv1 "github.com/chepkoy/one/api/v1"
+	icodeaiv1 "github.com/chepkoyallan/one/api/v1"
 	corev1 "k8s.io/api/core/v1"
 )
 

@@ -10,7 +10,7 @@ import (
 	awssdk "github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/iam"
-	icodeaiv1 "github.com/chepkoy/one/api/v1"
+	icodeaiv1 "github.com/chepkoyallan/one/api/v1"
 	"github.com/go-logr/logr"
 	"github.com/tidwall/gjson"
 	corev1 "k8s.io/api/core/v1"

@@ -3,7 +3,7 @@ package controllers
 import (
 	"context"
 	"fmt"
-	icodeaiv1 "github.com/chepkoy/one/api/v1"
+	icodeaiv1 "github.com/chepkoyallan/one/api/v1"
 	"github.com/go-logr/logr"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iam/v1"

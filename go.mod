@@ -1,4 +1,4 @@
-module github.com/chepkoy/one
+module github.com/chepkoyallan/one
 
 go 1.16
 

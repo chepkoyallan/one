@@ -1,7 +1,13 @@
 apiVersion: icodeai.icodeai.io/v1
 kind: Profile
 metadata:
-  name: profile-sample
+  name: icodeai
 spec:
-  # Add fields here
-  foo: bar
+  owner:
+    kind: User
+    name: icodeaike@gmail.com
+  resourceQuotaSpec:
+    hard:
+      cpu: "0.5"
+      memory: 1Gi
+      pods: "1"
