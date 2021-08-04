@@ -55,6 +55,10 @@ const (
 	IstioInjectionLabel = "istio-injection"
 )
 
+const DEFAULT_EDITOR = "default-editor"
+const DEFAULT_VIEWER = "default-viewer"
+const ICODEAIQUOTA = "kf-resource-quota"
+
 var NamespaceLabels = map[string]string{
 	"katib-metricscollector-injection":      "enabled",
 	"serving.kubeflow.org/inferenceservice": "enabled",
@@ -194,8 +198,62 @@ func (r *ProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// Update service accounts
 	// Create service account "default-editor" in target namespace.
 	// "default-editor" would have kubeflowEdit permission: edit all resources in target namespace except rbac.
-	//if err = r.updateSer
+	if err = r.updateServiceAccount(instance, DEFAULT_EDITOR, Edit); err != nil {
+		logger.Error(err, "error updating Service account", "namespace", instance.Name, "name", "defaultEditor")
+		IncRequestErrorCounter("error updating ServiceAccount", SEVERITY_MAJOR)
+		return reconcile.Result{}, err
+	}
+	// Create service account "default-viewer" in target namespace.
+	// "default-viewer" would have k8s default "view" permission: view all resources in target namespace.
+	if err = r.updateServiceAccount(instance, DEFAULT_VIEWER, View); err != nil {
+		logger.Error(err, "error updating service account", "namespace", instance.Name, "name", "defaultViewer")
+		IncRequestErrorCounter("error updating service account", SEVERITY_MAJOR)
+		return reconcile.Result{}, err
+	}
 
+	// Update owner rbac permission
+	// When ClusterRole was referred by namespaced roleBinding, the result permission will be namespaced as well.
+	roleBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{USER: instance.Spec.Owner.Name, ROLE: ADMIN},
+			Name:        "namespaceAdmin",
+			Namespace:   instance.Name,
+		},
+		// Use default cluster role 'admin for profile/namespace owner
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "IcodeAIAdmin",
+		},
+		Subjects: []rbacv1.Subject{
+			instance.Spec.Owner,
+		},
+	}
+	if err = r.updateRoleBinding(instance, roleBinding); err != nil {
+		logger.Error(err, "error Updating Owner Rolebinding", "namespace", instance.Name, "name", "defaultEditor")
+		IncRequestErrorCounter("error updating owner rolebinding", SEVERITY_MAJOR)
+		return reconcile.Result{}, err
+	}
+
+	// Create resource quota for targeted namespace if resource are specified in profile
+	if len(instance.Spec.ResourceQuotaSpec.Hard) > 0 {
+		resourceQuota := &corev1.ResourceQuota{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ICODEAIQUOTA,
+				Namespace: instance.Name,
+			},
+			Spec: instance.Spec.ResourceQuotaSpec,
+		}
+		if err = r.updateResourceQuota(instance, resourceQuota); err != nil {
+			logger.Error(err, "error updating resource quota", "namespace", instance.Name)
+			IncRequestErrorCounter("error updating resource quota", SEVERITY_MAJOR)
+			return reconcile.Result{}, err
+		}
+	} else {
+		logger.Info("No update on resource quota", "spec", instance.Spec.ResourceQuotaSpec.String())
+	}
+
+	//if err := r.Pa
 	return ctrl.Result{}, nil
 }
 
@@ -405,6 +463,38 @@ func (r *ProfileReconciler) updateRoleBinding(profileIns *icodeaiv1.Profile, rol
 			}
 		}
 
+	}
+	return nil
+}
+
+//update Resource Quota create or update resource Quota for target namespace
+func (r *ProfileReconciler) updateResourceQuota(profileIns *icodeaiv1.Profile, resourceQuota *corev1.ResourceQuota) error {
+	ctx := context.Background()
+	logger := r.Log.WithValues("profile", profileIns.Name)
+	if err := controllerutil.SetControllerReference(profileIns, resourceQuota, r.Scheme); err != nil {
+		return err
+	}
+	found := &corev1.ResourceQuota{}
+	err := r.Get(ctx, types.NamespacedName{Name: resourceQuota.Name, Namespace: resourceQuota.Namespace}, found)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logger.Info("creating ResourceQuota", "namespace", resourceQuota.Namespace, "name", resourceQuota.Name)
+			err = r.Create(ctx, resourceQuota)
+			if err != nil {
+				return err
+			}
+		} else {
+			return err
+		}
+	} else {
+		if !(reflect.DeepEqual(resourceQuota.Spec, found.Spec)) {
+			found.Spec = resourceQuota.Spec
+			logger.Info("updating resource quota", "namespace", resourceQuota.Namespace, "name", resourceQuota.Name)
+			err = r.Update(ctx, found)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
